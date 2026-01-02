@@ -9,8 +9,8 @@ from picamera2.outputs import FileOutput
 CONFIG = {
     "recordings_dir": Path.home() / "Desktop" / "Recordings",
     "video_size": (1920, 1080),
-    "bitrate": 1000000,
-    "rotation_hours": 6,
+    "bitrate": 200000,
+    "rotation_hours": 1,
 }
 
 
@@ -22,7 +22,7 @@ def create_filename():
     daily_folder = CONFIG["recordings_dir"] / date_str
     daily_folder.mkdir(parents=True, exist_ok=True)
 
-    return daily_folder / f"recording_{timestamp}.mp4"
+    return daily_folder / f"recording_{timestamp}.h264"
 
 
 def main():
@@ -44,6 +44,7 @@ def main():
 
             print(f"Starting recording: {filename}")
             picam2.start_encoder(encoder, output)
+
             time.sleep(CONFIG["rotation_hours"] * 3600)
             picam2.stop_encoder()
 
