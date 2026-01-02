@@ -9,7 +9,7 @@ dependencies = [
 ]
 
 [project.scripts]
-pi-record = "recorder.main:main"
+recorder = "recorder.main:main"
 
 [build-system]
 requires = ["hatchling"]
