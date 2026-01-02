@@ -9,7 +9,8 @@ from picamera2.outputs import FileOutput
 CONFIG = {
     "recordings_dir": Path.home() / "Desktop" / "Recordings",
     "video_size": (1920, 1080),
-    "bitrate": 200000,
+    "framerate": 24,
+    "bitrate": 1000000,
     "rotation_hours": 1,
 }
 
@@ -29,14 +30,20 @@ def main():
     CONFIG["recordings_dir"].mkdir(parents=True, exist_ok=True)
 
     picam2 = Picamera2()
+    frame_duration = int(1_000_000 / CONFIG["framerate"])
+
     video_config = picam2.create_video_configuration(
-        main={"size": CONFIG["video_size"]}
+        main={"size": CONFIG["video_size"]},
+        controls={
+            "FrameDurationLimits": (frame_duration, frame_duration),
+            "NoiseReductionMode": 2,
+        },
     )
+
     picam2.configure(video_config)
-
     encoder = H264Encoder(bitrate=CONFIG["bitrate"])
-
     picam2.start()
+
     try:
         while True:
             filename = create_filename()
@@ -46,9 +53,10 @@ def main():
             picam2.start_encoder(encoder, output)
 
             time.sleep(CONFIG["rotation_hours"] * 3600)
-            picam2.stop_encoder()
 
+            picam2.stop_encoder()
             print(f"Recording stopped: {filename}")
+
     except KeyboardInterrupt:
         print("Recording stopped by user")
     finally:
