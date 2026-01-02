@@ -20,6 +20,7 @@ packages = ["src/recorder"]
 
 [dependency-groups]
 dev = [
+    "pre-commit>=3.5.0",
     "ruff>=0.14.10",
 ]
 
