@@ -1,3 +1,4 @@
+import os
 import shutil
 import time
 from datetime import datetime
@@ -20,12 +21,33 @@ CONFIG = {
 _current_usb_index = 0
 
 
+def is_writable(path: Path) -> bool:
+    try:
+        return os.access(path, os.W_OK)
+    except OSError:
+        return False
+
+
 def get_usb_devices() -> list[Path]:
     usb_devices = []
-    if CONFIG["usb_mount_path"].exists():
-        for item in CONFIG["usb_mount_path"].iterdir():
-            if item.is_dir() and not item.name.startswith("."):
-                usb_devices.append(item)
+    if not CONFIG["usb_mount_path"].exists():
+        return usb_devices
+
+    try:
+        for user_dir in CONFIG["usb_mount_path"].iterdir():
+            if not user_dir.is_dir() or user_dir.name.startswith("."):
+                continue
+
+            try:
+                for device_dir in user_dir.iterdir():
+                    if device_dir.is_dir() and not device_dir.name.startswith("."):
+                        if is_writable(device_dir):
+                            usb_devices.append(device_dir)
+            except PermissionError:
+                continue
+    except PermissionError:
+        pass
+
     return sorted(usb_devices)
 
 
@@ -68,7 +90,16 @@ def create_filename() -> Path:
 
     recordings_dir = get_next_recording_dir()
     daily_folder = recordings_dir / date_str
-    daily_folder.mkdir(parents=True, exist_ok=True)
+
+    try:
+        daily_folder.mkdir(parents=True, exist_ok=True)
+    except PermissionError as e:
+        raise RuntimeError(
+            f"Permission denied: Cannot create directory {daily_folder}. "
+            f"Please check write permissions on the USB device."
+        ) from e
+    except OSError as e:
+        raise RuntimeError(f"Cannot create directory {daily_folder}: {e}") from e
 
     return daily_folder / f"recording_{timestamp}.h264"
 
