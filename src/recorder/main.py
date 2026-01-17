@@ -60,6 +60,62 @@ def is_device_full(path: Path, min_space_gb: float) -> bool:
     return get_available_space_gb(path) < min_space_gb
 
 
+def get_all_recording_dirs() -> list[Path]:
+    recording_dirs = []
+    usb_devices = get_usb_devices()
+    for usb_device in usb_devices:
+        recording_dirs.append(usb_device / "Recordings")
+    recording_dirs.append(CONFIG["recordings_dir"])
+    return recording_dirs
+
+
+def find_oldest_recording() -> Path | None:
+    oldest_file: Path | None = None
+    oldest_time: float | None = None
+
+    for recording_dir in get_all_recording_dirs():
+        if not recording_dir.exists():
+            continue
+
+        try:
+            for date_folder in recording_dir.iterdir():
+                if not date_folder.is_dir():
+                    continue
+
+                try:
+                    for file_path in date_folder.iterdir():
+                        if file_path.is_file() and file_path.suffix == ".h264":
+                            file_time = file_path.stat().st_mtime
+                            if oldest_time is None or file_time < oldest_time:
+                                oldest_time = file_time
+                                oldest_file = file_path
+                except (PermissionError, OSError):
+                    continue
+        except (PermissionError, OSError):
+            continue
+
+    return oldest_file
+
+
+def free_up_space(target_path: Path, min_space_gb: float) -> None:
+    while is_device_full(target_path, min_space_gb):
+        oldest_file = find_oldest_recording()
+        if oldest_file is None:
+            raise RuntimeError(
+                f"No recordings found to delete and insufficient storage: "
+                f"need {min_space_gb}GB free on {target_path}"
+            )
+
+        try:
+            file_size_gb = oldest_file.stat().st_size / (1024**3)
+            oldest_file.unlink()
+            print(f"Deleted oldest recording: {oldest_file} ({file_size_gb:.2f}GB)")
+        except (OSError, PermissionError) as e:
+            raise RuntimeError(
+                f"Failed to delete oldest recording {oldest_file}: {e}"
+            ) from e
+
+
 def get_next_recording_dir() -> Path:
     global _current_usb_index
     usb_devices = get_usb_devices()
@@ -69,18 +125,15 @@ def get_next_recording_dir() -> Path:
     if usb_devices:
         for _ in range(len(usb_devices)):
             usb_device = usb_devices[_current_usb_index % len(usb_devices)]
-            if not is_device_full(usb_device, min_space):
-                _current_usb_index += 1
-                return usb_device / "Recordings"
+            if is_device_full(usb_device, min_space):
+                free_up_space(usb_device, min_space)
             _current_usb_index += 1
+            return usb_device / "Recordings"
 
-    if not is_device_full(desktop_dir.parent, min_space):
-        return desktop_dir
+    if is_device_full(desktop_dir.parent, min_space):
+        free_up_space(desktop_dir.parent, min_space)
 
-    raise RuntimeError(
-        f"No available storage: all USB devices and Desktop have less than "
-        f"{min_space}GB free"
-    )
+    return desktop_dir
 
 
 def create_filename() -> Path:
