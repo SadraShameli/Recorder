@@ -18,7 +18,7 @@ CONFIG = {
     "usb_mount_path": Path("/media"),
 }
 
-_current_usb_index = 0
+_current_target_index = 0
 
 
 def is_writable(path: Path) -> bool:
@@ -60,20 +60,17 @@ def is_device_full(path: Path, min_space_gb: float) -> bool:
     return get_available_space_gb(path) < min_space_gb
 
 
-def get_all_recording_dirs() -> list[Path]:
-    recording_dirs = []
-    usb_devices = get_usb_devices()
-    for usb_device in usb_devices:
-        recording_dirs.append(usb_device / "Recordings")
-    recording_dirs.append(CONFIG["recordings_dir"])
-    return recording_dirs
-
-
-def find_oldest_recording() -> Path | None:
+def find_oldest_recording(targets: list[Path]) -> Path | None:
     oldest_file: Path | None = None
     oldest_time: float | None = None
+    desktop_target = CONFIG["recordings_dir"].parent
 
-    for recording_dir in get_all_recording_dirs():
+    for target in targets:
+        if target == desktop_target:
+            recording_dir = CONFIG["recordings_dir"]
+        else:
+            recording_dir = target / "Recordings"
+
         if not recording_dir.exists():
             continue
 
@@ -97,43 +94,42 @@ def find_oldest_recording() -> Path | None:
     return oldest_file
 
 
-def free_up_space(target_path: Path, min_space_gb: float) -> None:
-    while is_device_full(target_path, min_space_gb):
-        oldest_file = find_oldest_recording()
+def get_next_recording_dir() -> Path:
+    global _current_target_index
+    usb_devices = get_usb_devices()
+    desktop_dir = CONFIG["recordings_dir"]
+    desktop_target = desktop_dir.parent
+    min_space = CONFIG["min_free_space_gb"]
+
+    targets = usb_devices if usb_devices else [desktop_target]
+    _current_target_index = _current_target_index % len(targets)
+
+    current_target = targets[_current_target_index]
+
+    if is_device_full(current_target, min_space):
+        _current_target_index = (_current_target_index + 1) % len(targets)
+        current_target = targets[_current_target_index]
+
+    while is_device_full(current_target, min_space):
+        oldest_file = find_oldest_recording(targets)
         if oldest_file is None:
             raise RuntimeError(
-                f"No recordings found to delete and insufficient storage: "
-                f"need {min_space_gb}GB free on {target_path}"
+                "No recordings found to delete and insufficient storage across all targets."
             )
 
         try:
-            file_size_gb = oldest_file.stat().st_size / (1024**3)
             oldest_file.unlink()
-            print(f"Deleted oldest recording: {oldest_file} ({file_size_gb:.2f}GB)")
+            parent_dir = oldest_file.parent
+            if not any(parent_dir.iterdir()):
+                parent_dir.rmdir()
         except (OSError, PermissionError) as e:
             raise RuntimeError(
                 f"Failed to delete oldest recording {oldest_file}: {e}"
             ) from e
 
-
-def get_next_recording_dir() -> Path:
-    global _current_usb_index
-    usb_devices = get_usb_devices()
-    desktop_dir = CONFIG["recordings_dir"]
-    min_space = CONFIG["min_free_space_gb"]
-
-    if usb_devices:
-        for _ in range(len(usb_devices)):
-            usb_device = usb_devices[_current_usb_index % len(usb_devices)]
-            if is_device_full(usb_device, min_space):
-                free_up_space(usb_device, min_space)
-            _current_usb_index += 1
-            return usb_device / "Recordings"
-
-    if is_device_full(desktop_dir.parent, min_space):
-        free_up_space(desktop_dir.parent, min_space)
-
-    return desktop_dir
+    if current_target == desktop_target:
+        return desktop_dir
+    return current_target / "Recordings"
 
 
 def create_filename() -> Path:
@@ -148,8 +144,7 @@ def create_filename() -> Path:
         daily_folder.mkdir(parents=True, exist_ok=True)
     except PermissionError as e:
         raise RuntimeError(
-            f"Permission denied: Cannot create directory {daily_folder}. "
-            f"Please check write permissions on the USB device."
+            f"Permission denied: Cannot create directory {daily_folder}."
         ) from e
     except OSError as e:
         raise RuntimeError(f"Cannot create directory {daily_folder}: {e}") from e
@@ -179,15 +174,19 @@ def main():
         while True:
             filename = create_filename()
             output = FileOutput(str(filename))
+            target_drive = filename.parent.parent
 
-            available_space = get_available_space_gb(filename.parent.parent)
-            print(
-                f"Starting recording: {filename} "
-                f"(Available space: {available_space:.2f}GB)"
-            )
             picam2.start_encoder(encoder, output)
+            print(f"Starting recording: {filename}")
 
-            time.sleep(CONFIG["rotation_hours"] * 3600)
+            start_time = time.time()
+            recording_duration = CONFIG["rotation_hours"] * 3600
+
+            while time.time() - start_time < recording_duration:
+                if is_device_full(target_drive, CONFIG["min_free_space_gb"]):
+                    print("Drive reached capacity limit. Rotating early.")
+                    break
+                time.sleep(5)
 
             picam2.stop_encoder()
             print(f"Recording stopped: {filename}")
@@ -197,8 +196,14 @@ def main():
     except RuntimeError as e:
         print(f"Error: {e}")
     finally:
-        picam2.stop_encoder()
-        picam2.stop()
+        try:
+            picam2.stop_encoder()
+        except Exception:
+            pass
+        try:
+            picam2.stop()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
