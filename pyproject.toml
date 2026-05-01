@@ -1,5 +1,5 @@
 [project]
-dependencies = ["picamera2; platform_system=='Linux'"]
+dependencies = ["picamera2 ; platform_system == 'Linux'"]
 description = "Raspberry Pi continuous video recorder with auto-rotation"
 name = "recorder"
 readme = "README.md"
@@ -21,7 +21,7 @@ dev = ["pre-commit>=3.5.0", "ruff>=0.14.10"]
 
 [tool.ruff]
 line-length = 88
-target-version = "py38"
+target-version = "py310"
 
 [tool.ruff.lint]
 ignore = []
