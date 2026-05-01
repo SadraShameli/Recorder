@@ -1,6 +1,8 @@
+import json
 import os
 import shutil
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -8,17 +10,41 @@ from picamera2 import Picamera2
 from picamera2.encoders import H264Encoder
 from picamera2.outputs import FileOutput
 
-CONFIG = {
-    "recordings_dir": Path.home() / "Desktop" / "Recordings",
-    "video_size": (1920, 1080),
-    "framerate": 24,
-    "bitrate": 1000000,
-    "rotation_hours": 1,
-    "min_free_space_gb": 2,
-    "usb_mount_path": Path("/media"),
-}
+_STATE_FILE = (
+    Path(__file__).resolve().parent.parent.parent / ".tmp" / "recorder_state.json"
+)
 
-_current_target_index = 0
+
+@dataclass(kw_only=True, slots=True, frozen=True)
+class RecorderConfig:
+    recordings_dir: Path = Path.home() / "Desktop" / "Recordings"
+    video_size: tuple[int, int] = (1920, 1080)
+    framerate: int = 24
+    bitrate: int = 1_000_000
+    rotation_hours: int = 1
+    min_free_space_gb: float = 2.0
+    usb_mount_path: Path = Path("/media")
+
+
+@dataclass(kw_only=True, slots=True)
+class SelectorState:
+    current_target: str
+
+
+def _load_selector_state() -> SelectorState:
+    try:
+        raw = json.loads(_STATE_FILE.read_text())
+        return SelectorState(current_target=raw.get("current_target", ""))
+    except (OSError, json.JSONDecodeError):
+        return SelectorState(current_target="")
+
+
+def _save_selector_state(state: SelectorState) -> None:
+    try:
+        _STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _STATE_FILE.write_text(json.dumps({"current_target": state.current_target}))
+    except OSError:
+        pass
 
 
 def is_writable(path: Path) -> bool:
@@ -28,13 +54,13 @@ def is_writable(path: Path) -> bool:
         return False
 
 
-def get_usb_devices() -> list[Path]:
+def get_usb_devices(config: RecorderConfig) -> list[Path]:
     usb_devices = []
-    if not CONFIG["usb_mount_path"].exists():
+    if not config.usb_mount_path.exists():
         return usb_devices
 
     try:
-        for user_dir in CONFIG["usb_mount_path"].iterdir():
+        for user_dir in config.usb_mount_path.iterdir():
             if not user_dir.is_dir() or user_dir.name.startswith("."):
                 continue
 
@@ -52,24 +78,27 @@ def get_usb_devices() -> list[Path]:
 
 
 def get_available_space_gb(path: Path) -> float:
-    stat = shutil.disk_usage(path)
-    return stat.free / (1024**3)
+    try:
+        stat = shutil.disk_usage(path)
+        return stat.free / (1024**3)
+    except OSError:
+        return 0.0
 
 
 def is_device_full(path: Path, min_space_gb: float) -> bool:
     return get_available_space_gb(path) < min_space_gb
 
 
-def find_oldest_recording(targets: list[Path]) -> Path | None:
+def find_oldest_recording(
+    targets: list[Path], desktop_dir: Path, desktop_target: Path
+) -> Path | None:
     oldest_file: Path | None = None
     oldest_time: float | None = None
-    desktop_target = CONFIG["recordings_dir"].parent
 
     for target in targets:
-        if target == desktop_target:
-            recording_dir = CONFIG["recordings_dir"]
-        else:
-            recording_dir = target / "Recordings"
+        recording_dir = (
+            desktop_dir if target == desktop_target else target / "Recordings"
+        )
 
         if not recording_dir.exists():
             continue
@@ -94,50 +123,77 @@ def find_oldest_recording(targets: list[Path]) -> Path | None:
     return oldest_file
 
 
-def get_next_recording_dir() -> Path:
-    global _current_target_index
-    usb_devices = get_usb_devices()
-    desktop_dir = CONFIG["recordings_dir"]
-    desktop_target = desktop_dir.parent
-    min_space = CONFIG["min_free_space_gb"]
+class DriveSelector:
+    def __init__(self, config: RecorderConfig) -> None:
+        self._config = config
+        self._current_target_index = 0
+        self._restore_index_from_state()
 
-    targets = usb_devices if usb_devices else [desktop_target]
-    _current_target_index = _current_target_index % len(targets)
+    def _restore_index_from_state(self) -> None:
+        state = _load_selector_state()
+        if not state.current_target:
+            return
 
-    current_target = targets[_current_target_index]
+        saved_path = Path(state.current_target)
+        usb_devices = get_usb_devices(self._config)
+        desktop_target = self._config.recordings_dir.parent
+        targets = usb_devices if usb_devices else [desktop_target]
 
-    if is_device_full(current_target, min_space):
-        _current_target_index = (_current_target_index + 1) % len(targets)
-        current_target = targets[_current_target_index]
+        for i, target in enumerate(targets):
+            if target == saved_path:
+                self._current_target_index = i
+                return
 
-    while is_device_full(current_target, min_space):
-        oldest_file = find_oldest_recording(targets)
-        if oldest_file is None:
-            raise RuntimeError(
-                "No recordings found to delete and insufficient storage across all targets."
+    def get_next_recording_dir(self) -> Path:
+        config = self._config
+        usb_devices = get_usb_devices(config)
+        desktop_dir = config.recordings_dir
+        desktop_target = desktop_dir.parent
+        min_space = config.min_free_space_gb
+
+        targets = usb_devices if usb_devices else [desktop_target]
+        self._current_target_index = self._current_target_index % len(targets)
+
+        for offset in range(len(targets)):
+            candidate = (self._current_target_index + offset) % len(targets)
+            if not is_device_full(targets[candidate], min_space):
+                self._current_target_index = candidate
+                break
+
+        current_target = targets[self._current_target_index]
+
+        while is_device_full(current_target, min_space):
+            oldest_file = find_oldest_recording(
+                [current_target], desktop_dir, desktop_target
             )
+            if oldest_file is None:
+                raise RuntimeError(
+                    "No recordings found to delete and insufficient storage."
+                )
 
-        try:
-            oldest_file.unlink()
-            parent_dir = oldest_file.parent
-            if not any(parent_dir.iterdir()):
-                parent_dir.rmdir()
-        except (OSError, PermissionError) as e:
-            raise RuntimeError(
-                f"Failed to delete oldest recording {oldest_file}: {e}"
-            ) from e
+            try:
+                oldest_file.unlink()
+                parent_dir = oldest_file.parent
+                if not any(parent_dir.iterdir()):
+                    parent_dir.rmdir()
+            except (OSError, PermissionError) as e:
+                raise RuntimeError(
+                    f"Failed to delete oldest recording {oldest_file}: {e}"
+                ) from e
 
-    if current_target == desktop_target:
-        return desktop_dir
-    return current_target / "Recordings"
+        _save_selector_state(SelectorState(current_target=str(current_target)))
+
+        if current_target == desktop_target:
+            return desktop_dir
+        return current_target / "Recordings"
 
 
-def create_filename() -> Path:
+def create_filename(drive_selector: DriveSelector) -> Path:
     now = datetime.now()
     date_str = now.strftime("%Y-%m-%d")
     timestamp = now.strftime("%Y%m%d_%H%M%S")
 
-    recordings_dir = get_next_recording_dir()
+    recordings_dir = drive_selector.get_next_recording_dir()
     daily_folder = recordings_dir / date_str
 
     try:
@@ -153,13 +209,15 @@ def create_filename() -> Path:
 
 
 def main():
-    CONFIG["recordings_dir"].mkdir(parents=True, exist_ok=True)
+    config = RecorderConfig()
+    config.recordings_dir.mkdir(parents=True, exist_ok=True)
+    drive_selector = DriveSelector(config)
 
     picam2 = Picamera2()
-    frame_duration = int(1_000_000 / CONFIG["framerate"])
+    frame_duration = int(1_000_000 / config.framerate)
 
     video_config = picam2.create_video_configuration(
-        main={"size": CONFIG["video_size"]},
+        main={"size": config.video_size},
         controls={
             "FrameDurationLimits": (frame_duration, frame_duration),
             "NoiseReductionMode": 2,
@@ -167,23 +225,23 @@ def main():
     )
 
     picam2.configure(video_config)
-    encoder = H264Encoder(bitrate=CONFIG["bitrate"])
     picam2.start()
 
     try:
         while True:
-            filename = create_filename()
+            filename = create_filename(drive_selector)
             output = FileOutput(str(filename))
             target_drive = filename.parent.parent
 
+            encoder = H264Encoder(bitrate=config.bitrate)
             picam2.start_encoder(encoder, output)
             print(f"Starting recording: {filename}")
 
             start_time = time.time()
-            recording_duration = CONFIG["rotation_hours"] * 3600
+            recording_duration = config.rotation_hours * 3600
 
             while time.time() - start_time < recording_duration:
-                if is_device_full(target_drive, CONFIG["min_free_space_gb"]):
+                if is_device_full(target_drive, config.min_free_space_gb):
                     print("Drive reached capacity limit. Rotating early.")
                     break
                 time.sleep(5)
