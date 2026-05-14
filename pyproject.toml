@@ -1,5 +1,8 @@
 [project]
-dependencies = ["picamera2 ; platform_system == 'Linux'"]
+dependencies = [
+    "picamera2 ; platform_system == 'Linux'",
+    "opencv-python-headless ; platform_system == 'Linux'",
+]
 description = "Raspberry Pi continuous video recorder with auto-rotation"
 name = "recorder"
 readme = "README.md"

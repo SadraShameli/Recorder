@@ -1,18 +1,32 @@
 import json
+import logging
 import os
 import shutil
+import signal
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from types import FrameType
 
-from picamera2 import Picamera2
+from picamera2 import MappedArray, Picamera2
 from picamera2.encoders import H264Encoder
 from picamera2.outputs import FileOutput
+
+try:
+    import cv2  # ty: ignore[unresolved-import]
+
+    _HAS_CV2 = True
+except ImportError:
+    _HAS_CV2 = False
+
 
 _STATE_FILE = (
     Path(__file__).resolve().parent.parent.parent / ".tmp" / "recorder_state.json"
 )
+
+logger = logging.getLogger("recorder")
 
 
 @dataclass(kw_only=True, slots=True, frozen=True)
@@ -22,29 +36,17 @@ class RecorderConfig:
     framerate: int = 24
     bitrate: int = 1_000_000
     rotation_hours: int = 1
-    min_free_space_gb: float = 2.0
+    min_free_space_gb: float = 1.0
     usb_mount_path: Path = Path("/media")
+    poll_interval_seconds: int = 5
+    hotplug_check_interval_seconds: int = 30
+    watchdog_restart_delay_seconds: int = 10
+    enable_timestamp_overlay: bool = True
 
 
 @dataclass(kw_only=True, slots=True)
 class SelectorState:
     current_target: str
-
-
-def _load_selector_state() -> SelectorState:
-    try:
-        raw = json.loads(_STATE_FILE.read_text())
-        return SelectorState(current_target=raw.get("current_target", ""))
-    except (OSError, json.JSONDecodeError):
-        return SelectorState(current_target="")
-
-
-def _save_selector_state(state: SelectorState) -> None:
-    try:
-        _STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        _STATE_FILE.write_text(json.dumps({"current_target": state.current_target}))
-    except OSError:
-        pass
 
 
 def is_writable(path: Path) -> bool:
@@ -55,7 +57,7 @@ def is_writable(path: Path) -> bool:
 
 
 def get_usb_devices(config: RecorderConfig) -> list[Path]:
-    usb_devices = []
+    usb_devices: list[Path] = []
     if not config.usb_mount_path.exists():
         return usb_devices
 
@@ -87,6 +89,16 @@ def get_available_space_gb(path: Path) -> float:
 
 def is_device_full(path: Path, min_space_gb: float) -> bool:
     return get_available_space_gb(path) < min_space_gb
+
+
+def get_targets(config: RecorderConfig) -> list[Path]:
+    usb_devices = get_usb_devices(config)
+    return usb_devices if usb_devices else [config.recordings_dir.parent]
+
+
+def log_targets_free_space(config: RecorderConfig) -> None:
+    for target in get_targets(config):
+        logger.info("Target %s: %.2f GB free", target, get_available_space_gb(target))
 
 
 def find_oldest_recording(
@@ -129,15 +141,27 @@ class DriveSelector:
         self._current_target_index = 0
         self._restore_index_from_state()
 
+    def _load_state(self) -> SelectorState:
+        try:
+            raw = json.loads(_STATE_FILE.read_text())
+            return SelectorState(current_target=raw.get("current_target", ""))
+        except (OSError, json.JSONDecodeError):
+            return SelectorState(current_target="")
+
+    def _save_state(self, state: SelectorState) -> None:
+        try:
+            _STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            _STATE_FILE.write_text(json.dumps({"current_target": state.current_target}))
+        except OSError as exc:
+            logger.warning("Failed to persist selector state: %s", exc)
+
     def _restore_index_from_state(self) -> None:
-        state = _load_selector_state()
+        state = self._load_state()
         if not state.current_target:
             return
 
         saved_path = Path(state.current_target)
-        usb_devices = get_usb_devices(self._config)
-        desktop_target = self._config.recordings_dir.parent
-        targets = usb_devices if usb_devices else [desktop_target]
+        targets = get_targets(self._config)
 
         for i, target in enumerate(targets):
             if target == saved_path:
@@ -146,12 +170,11 @@ class DriveSelector:
 
     def get_next_recording_dir(self) -> Path:
         config = self._config
-        usb_devices = get_usb_devices(config)
         desktop_dir = config.recordings_dir
         desktop_target = desktop_dir.parent
         min_space = config.min_free_space_gb
 
-        targets = usb_devices if usb_devices else [desktop_target]
+        targets = get_targets(config)
         self._current_target_index = self._current_target_index % len(targets)
 
         for offset in range(len(targets)):
@@ -181,7 +204,7 @@ class DriveSelector:
                     f"Failed to delete oldest recording {oldest_file}: {e}"
                 ) from e
 
-        _save_selector_state(SelectorState(current_target=str(current_target)))
+        self._save_state(SelectorState(current_target=str(current_target)))
 
         if current_target == desktop_target:
             return desktop_dir
@@ -208,14 +231,57 @@ def create_filename(drive_selector: DriveSelector) -> Path:
     return daily_folder / f"recording_{timestamp}.h264"
 
 
-def main():
-    config = RecorderConfig()
-    config.recordings_dir.mkdir(parents=True, exist_ok=True)
-    drive_selector = DriveSelector(config)
+def _apply_timestamp_overlay(request) -> None:
+    timestamp_text = time.strftime("%Y-%m-%d %H:%M:%S")
+    with MappedArray(request, "main") as mapped:
+        cv2.putText(
+            mapped.array,
+            timestamp_text,
+            (10, 40),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1.0,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
 
+
+def finalize_partial(partial: Path, final: Path) -> None:
+    if not partial.exists():
+        return
+    try:
+        partial.rename(final)
+    except OSError as exc:
+        logger.error("Failed to finalize %s -> %s: %s", partial, final, exc)
+
+
+def preflight_checks(config: RecorderConfig) -> None:
+    cameras = Picamera2.global_camera_info()
+    if not cameras:
+        raise RuntimeError("No camera detected by Picamera2")
+
+    config.recordings_dir.mkdir(parents=True, exist_ok=True)
+    if not is_writable(config.recordings_dir):
+        raise RuntimeError(f"Recordings dir not writable: {config.recordings_dir}")
+
+    targets = get_targets(config)
+    if not any(
+        not is_device_full(target, config.min_free_space_gb) for target in targets
+    ):
+        logger.warning(
+            "All targets below %.2f GB free; rotation will rely on auto-cleanup",
+            config.min_free_space_gb,
+        )
+
+    if config.enable_timestamp_overlay and not _HAS_CV2:
+        logger.warning(
+            "Timestamp overlay enabled but cv2 not available; skipping overlay"
+        )
+
+
+def _build_picam(config: RecorderConfig) -> Picamera2:
     picam2 = Picamera2()
     frame_duration = int(1_000_000 / config.framerate)
-
     video_config = picam2.create_video_configuration(
         main={"size": config.video_size},
         controls={
@@ -223,45 +289,134 @@ def main():
             "NoiseReductionMode": 2,
         },
     )
-
     picam2.configure(video_config)
+    if config.enable_timestamp_overlay and _HAS_CV2:
+        picam2.pre_callback = _apply_timestamp_overlay
     picam2.start()
+    return picam2
+
+
+def _record_one_rotation(
+    picam2: Picamera2,
+    config: RecorderConfig,
+    drive_selector: DriveSelector,
+    shutdown_event: threading.Event,
+) -> None:
+    final_path = create_filename(drive_selector)
+    partial_path = final_path.with_name(final_path.name + ".partial")
+    target_drive = final_path.parent.parent
+
+    log_targets_free_space(config)
+
+    output = FileOutput(str(partial_path))
+    encoder = H264Encoder(bitrate=config.bitrate)
+    picam2.start_encoder(encoder, output)
+    logger.info("Starting recording: %s", partial_path)
 
     try:
-        while True:
-            filename = create_filename(drive_selector)
-            output = FileOutput(str(filename))
-            target_drive = filename.parent.parent
+        start_time = time.time()
+        recording_duration = config.rotation_hours * 3600
+        last_hotplug_check = start_time
+        was_on_fallback = target_drive == config.recordings_dir.parent
 
-            encoder = H264Encoder(bitrate=config.bitrate)
-            picam2.start_encoder(encoder, output)
-            print(f"Starting recording: {filename}")
+        while time.time() - start_time < recording_duration:
+            if shutdown_event.wait(config.poll_interval_seconds):
+                logger.info("Shutdown requested; ending current rotation")
+                return
 
-            start_time = time.time()
-            recording_duration = config.rotation_hours * 3600
+            if is_device_full(target_drive, config.min_free_space_gb):
+                logger.info("Drive %s reached capacity; rotating early", target_drive)
+                return
 
-            while time.time() - start_time < recording_duration:
-                if is_device_full(target_drive, config.min_free_space_gb):
-                    print("Drive reached capacity limit. Rotating early.")
-                    break
-                time.sleep(5)
-
-            picam2.stop_encoder()
-            print(f"Recording stopped: {filename}")
-
-    except KeyboardInterrupt:
-        print("Recording stopped by user")
-    except RuntimeError as e:
-        print(f"Error: {e}")
+            now = time.time()
+            if now - last_hotplug_check >= config.hotplug_check_interval_seconds:
+                last_hotplug_check = now
+                if not target_drive.exists():
+                    logger.warning(
+                        "Target %s no longer present; rotating early", target_drive
+                    )
+                    return
+                if was_on_fallback and get_usb_devices(config):
+                    logger.info("USB drive inserted while on fallback; rotating to it")
+                    return
     finally:
         try:
             picam2.stop_encoder()
-        except Exception:
-            pass
+        except RuntimeError as exc:
+            logger.debug("stop_encoder during rotation end: %s", exc)
+        finalize_partial(partial_path, final_path)
+        logger.info("Recording finalized: %s", final_path)
+
+
+def _run_recorder(
+    config: RecorderConfig,
+    drive_selector: DriveSelector,
+    shutdown_event: threading.Event,
+) -> None:
+    picam2 = _build_picam(config)
+    try:
+        while not shutdown_event.is_set():
+            _record_one_rotation(picam2, config, drive_selector, shutdown_event)
+    finally:
+        try:
+            picam2.stop_encoder()
+        except RuntimeError as exc:
+            logger.debug("stop_encoder during shutdown: %s", exc)
         try:
             picam2.stop()
+        except RuntimeError as exc:
+            logger.debug("stop during shutdown: %s", exc)
+        try:
+            picam2.close()
+        except RuntimeError as exc:
+            logger.debug("close during shutdown: %s", exc)
+
+
+def _install_signal_handlers(shutdown_event: threading.Event) -> None:
+    def _handler(signum: int, _frame: FrameType | None) -> None:
+        logger.info("Received signal %s; initiating graceful shutdown", signum)
+        shutdown_event.set()
+
+    signal.signal(signal.SIGTERM, _handler)
+    signal.signal(signal.SIGINT, _handler)
+
+
+def _configure_logging() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+
+
+def main() -> None:
+    _configure_logging()
+    config = RecorderConfig()
+
+    shutdown_event = threading.Event()
+    _install_signal_handlers(shutdown_event)
+
+    try:
+        preflight_checks(config)
+    except RuntimeError as exc:
+        logger.error("Pre-flight failed: %s", exc)
+        raise
+
+    drive_selector = DriveSelector(config)
+
+    while not shutdown_event.is_set():
+        try:
+            _run_recorder(config, drive_selector, shutdown_event)
         except Exception:
-            pass
+            if shutdown_event.is_set():
+                break
+            logger.exception(
+                "Recorder session crashed; restarting in %ds",
+                config.watchdog_restart_delay_seconds,
+            )
+            if shutdown_event.wait(config.watchdog_restart_delay_seconds):
+                break
+
+    logger.info("Recorder shutdown complete")
 
 
 if __name__ == "__main__":
