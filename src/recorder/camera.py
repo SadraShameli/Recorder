@@ -4,6 +4,7 @@ import logging
 import threading
 import time
 from enum import Enum, auto
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .config import RecorderConfig
@@ -134,6 +135,8 @@ class Recorder:
         self._picam2.start_encoder(encoder, output)
         logger.info("Starting recording: %s", partial_path)
 
+        self._save_preview(final_path)
+
         outcome = RotationOutcome.TIME_ELAPSED
         try:
             start_time = time.time()
@@ -169,6 +172,15 @@ class Recorder:
 
         logger.info(_ROTATION_LOG_MESSAGES[outcome], target_drive)
         return outcome
+
+    def _save_preview(self, final_path: Path) -> None:
+        assert self._picam2 is not None
+        preview_path = final_path.with_suffix(".jpg")
+        try:
+            self._picam2.capture_file(str(preview_path), name="main")
+            logger.info("Preview saved: %s", preview_path)
+        except (OSError, RuntimeError) as exc:
+            logger.warning("Failed to capture preview %s: %s", preview_path, exc)
 
     def _close(self) -> None:
         assert self._picam2 is not None
