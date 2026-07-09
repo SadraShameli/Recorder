@@ -1,13 +1,16 @@
 .DEFAULT_GOAL := help
 
 PACKAGE_NAME = recorder
+UNAME_S := $(shell uname -s)
 
 .PHONY: pre-install
 pre-install:
 ifeq ($(OS), Windows_NT)
 	pip install uv
-else
+else ifeq ($(UNAME_S), Darwin)
 	brew install uv
+else
+	curl -LsSf https://astral.sh/uv/install.sh | sh
 endif
 
 .PHONY: install
