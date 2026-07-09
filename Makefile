@@ -15,7 +15,11 @@ endif
 
 .PHONY: install
 install: pre-install
-	uv venv --python 3.14
+ifeq ($(UNAME_S), Linux)
+	uv venv --python 3.13 --system-site-packages
+else
+	uv venv --python 3.13
+endif
 	uv sync
 
 .PHONY: install-global

@@ -97,9 +97,9 @@ def find_oldest_recording(
                             if oldest_time is None or file_time < oldest_time:
                                 oldest_time = file_time
                                 oldest_file = file_path
-                except PermissionError, OSError:
+                except (PermissionError, OSError):
                     continue
-        except PermissionError, OSError:
+        except (PermissionError, OSError):
             continue
 
     return oldest_file

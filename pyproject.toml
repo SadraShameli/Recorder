@@ -8,7 +8,7 @@ dependencies = [
 description = "Raspberry Pi continuous video recorder with auto-rotation"
 name = "recorder"
 readme = "README.md"
-requires-python = ">=3.14"
+requires-python = ">=3.13"
 version = "0.1.0"
 
 [project.scripts]
@@ -29,7 +29,7 @@ dependency-metadata = [{ name = "python-prctl", version = "1.8.1" }]
 
 [tool.ruff]
 line-length = 88
-target-version = "py314"
+target-version = "py313"
 
 [tool.ruff.lint]
 ignore = []
