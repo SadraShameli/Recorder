@@ -1,7 +1,7 @@
 import logging
 import os
-import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -51,10 +51,10 @@ class SystemdService:
         )
 
     def _resolve_exec_path(self) -> Path:
-        exe = shutil.which("recorder")
-        if exe is None:
-            raise RuntimeError("Could not locate the recorder executable on PATH")
-        return Path(exe).resolve()
+        exe = Path(sys.argv[0]).resolve()
+        if not exe.is_file():
+            raise RuntimeError(f"Could not resolve the recorder executable ({exe})")
+        return exe
 
     def _require_root(self) -> None:
         if os.geteuid() != 0:
