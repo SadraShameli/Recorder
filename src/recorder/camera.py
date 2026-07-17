@@ -7,6 +7,7 @@ from enum import Enum, auto
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from . import paths
 from .config import RecorderConfig
 from .storage import (
     DriveSelector,
@@ -149,6 +150,8 @@ class Recorder:
                     outcome = RotationOutcome.SHUTDOWN
                     break
 
+                self._maybe_capture_live_snapshot()
+
                 if is_device_full(target_drive, config.min_free_space_gb):
                     outcome = RotationOutcome.DRIVE_FULL
                     break
@@ -181,6 +184,18 @@ class Recorder:
             logger.info("Preview saved: %s", preview_path)
         except (OSError, RuntimeError) as exc:
             logger.warning("Failed to capture preview %s: %s", preview_path, exc)
+
+    def _maybe_capture_live_snapshot(self) -> None:
+        assert self._picam2 is not None
+        if not paths.PATH_LIVE_SNAPSHOT_REQUEST.exists():
+            return
+        try:
+            self._picam2.capture_file(str(paths.PATH_LIVE_SNAPSHOT), name="main")
+            logger.info("Live snapshot captured: %s", paths.PATH_LIVE_SNAPSHOT)
+        except (OSError, RuntimeError) as exc:
+            logger.warning("Failed to capture live snapshot: %s", exc)
+        finally:
+            paths.PATH_LIVE_SNAPSHOT_REQUEST.unlink(missing_ok=True)
 
     def _close(self) -> None:
         assert self._picam2 is not None

@@ -1,12 +1,13 @@
 import logging
 import tempfile
 import threading
+import time
 import uuid
 from pathlib import Path
 
 import httpx
 
-from .. import storage
+from .. import paths, storage
 from ..config import RecorderConfig
 from ..service import RecorderServiceKind, SystemdService
 from .client import (
@@ -28,11 +29,14 @@ _ERROR_BACKOFF_SECONDS = 5
 _LIST_PAGE_SIZE = 5
 _MAX_MESSAGE_CHARS = 4000
 _LOG_LINES = 100
+_LIVE_SNAPSHOT_TIMEOUT_SECONDS = 15
+_LIVE_SNAPSHOT_POLL_INTERVAL_SECONDS = 0.5
 
 _COMMAND_LIST_TEXT = (
     "/status - recorder service health and active drive\n"
     "/drives - storage targets, free space, recording counts\n"
-    "/preview - latest camera snapshot\n"
+    "/preview - latest saved camera snapshot\n"
+    "/live - capture and send a fresh snapshot right now\n"
     "/autopush - toggle automatic preview push\n"
     "/list - browse and delete recordings\n"
     "/clear - bulk-delete recordings\n"
@@ -58,6 +62,7 @@ class TelegramBot:
             TelegramCommand.STATUS: self._handle_status,
             TelegramCommand.DRIVES: self._handle_drives,
             TelegramCommand.PREVIEW: self._handle_preview,
+            TelegramCommand.LIVE: self._handle_live,
             TelegramCommand.AUTOPUSH: self._handle_autopush,
             TelegramCommand.LIST: self._handle_list,
             TelegramCommand.CLEAR: self._handle_clear,
@@ -207,6 +212,34 @@ class TelegramBot:
             self._client.send_message(chat_id, "No preview available yet")
             return
         self._client.send_photo(chat_id, preview, caption=preview.stem)
+
+    def _live_snapshot_ready(self, request_time: float) -> bool:
+        try:
+            return paths.PATH_LIVE_SNAPSHOT.stat().st_mtime >= request_time
+        except OSError:
+            return False
+
+    def _handle_live(self, chat_id: str, args: list[str]) -> None:
+        if not SystemdService(RecorderServiceKind.RECORDER).is_active():
+            self._client.send_message(chat_id, "recorder.service is not running")
+            return
+
+        request_time = time.time()
+        paths.PATH_DATA_USER.mkdir(parents=True, exist_ok=True)
+        paths.PATH_LIVE_SNAPSHOT_REQUEST.touch()
+
+        deadline = request_time + _LIVE_SNAPSHOT_TIMEOUT_SECONDS
+        while time.time() < deadline:
+            if self._live_snapshot_ready(request_time):
+                self._client.send_photo(
+                    chat_id, paths.PATH_LIVE_SNAPSHOT, caption="Live"
+                )
+                return
+            if self._shutdown_event.wait(_LIVE_SNAPSHOT_POLL_INTERVAL_SECONDS):
+                return
+
+        paths.PATH_LIVE_SNAPSHOT_REQUEST.unlink(missing_ok=True)
+        self._client.send_message(chat_id, "Timed out waiting for a live snapshot")
 
     def _autopush_status_text(self) -> str:
         state = "on" if self._bot_config.auto_push_preview else "off"

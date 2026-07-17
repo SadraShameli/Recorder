@@ -16,3 +16,5 @@ PATH_ROOT = UtilPath.get_root_path()
 PATH_DATA_USER = PATH_ROOT / "data_user"
 PATH_CONFIG = PATH_DATA_USER / "config.json"
 PATH_STATE = PATH_DATA_USER / "recorder_state.json"
+PATH_LIVE_SNAPSHOT_REQUEST = PATH_DATA_USER / "live_snapshot_request"
+PATH_LIVE_SNAPSHOT = PATH_DATA_USER / "live_snapshot.jpg"

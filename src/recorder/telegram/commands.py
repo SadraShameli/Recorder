@@ -7,6 +7,7 @@ class TelegramCommand(Enum):
     STATUS = "/status"
     DRIVES = "/drives"
     PREVIEW = "/preview"
+    LIVE = "/live"
     AUTOPUSH = "/autopush"
     LIST = "/list"
     CLEAR = "/clear"
