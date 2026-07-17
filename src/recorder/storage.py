@@ -1,16 +1,15 @@
 import logging
 import os
 import shutil
+from collections.abc import Iterator
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
 from pydantic import BaseModel, ValidationError
 
+from . import paths
 from .config import RecorderConfig
-
-_STATE_FILE = (
-    Path(__file__).resolve().parent.parent.parent / ".tmp" / "recorder_state.json"
-)
 
 logger = logging.getLogger(__name__)
 
@@ -71,12 +70,9 @@ def log_targets_free_space(config: RecorderConfig) -> None:
         logger.info("Target %s: %.2f GB free", target, get_available_space_gb(target))
 
 
-def find_oldest_recording(
-    targets: list[Path], desktop_dir: Path, desktop_target: Path
-) -> Path | None:
-    oldest_file: Path | None = None
-    oldest_time: float | None = None
-
+def iter_recordings(
+    targets: list[Path], desktop_dir: Path, desktop_target: Path, suffix: str
+) -> Iterator[Path]:
     for target in targets:
         recording_dir = (
             desktop_dir if target == desktop_target else target / "Recordings"
@@ -92,17 +88,94 @@ def find_oldest_recording(
 
                 try:
                     for file_path in date_folder.iterdir():
-                        if file_path.is_file() and file_path.suffix == ".h264":
-                            file_time = file_path.stat().st_mtime
-                            if oldest_time is None or file_time < oldest_time:
-                                oldest_time = file_time
-                                oldest_file = file_path
+                        if file_path.is_file() and file_path.suffix == suffix:
+                            yield file_path
                 except (PermissionError, OSError):
                     continue
         except (PermissionError, OSError):
             continue
 
-    return oldest_file
+
+def _safe_mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def find_oldest_recording(
+    targets: list[Path], desktop_dir: Path, desktop_target: Path
+) -> Path | None:
+    return min(
+        iter_recordings(targets, desktop_dir, desktop_target, ".h264"),
+        key=_safe_mtime,
+        default=None,
+    )
+
+
+def find_newest_preview(
+    targets: list[Path], desktop_dir: Path, desktop_target: Path
+) -> Path | None:
+    return max(
+        iter_recordings(targets, desktop_dir, desktop_target, ".jpg"),
+        key=_safe_mtime,
+        default=None,
+    )
+
+
+def list_recordings(
+    targets: list[Path], desktop_dir: Path, desktop_target: Path
+) -> list[Path]:
+    return sorted(
+        iter_recordings(targets, desktop_dir, desktop_target, ".h264"),
+        key=_safe_mtime,
+        reverse=True,
+    )
+
+
+@dataclass(kw_only=True, slots=True, frozen=True)
+class RecordingStats:
+    count: int
+    total_bytes: int
+
+
+def get_recording_stats(
+    target: Path, desktop_dir: Path, desktop_target: Path
+) -> RecordingStats:
+    count = 0
+    total_bytes = 0
+    for file_path in iter_recordings([target], desktop_dir, desktop_target, ".h264"):
+        count += 1
+        try:
+            total_bytes += file_path.stat().st_size
+        except OSError:
+            continue
+    return RecordingStats(count=count, total_bytes=total_bytes)
+
+
+def delete_recording_pair(h264_path: Path) -> None:
+    h264_path.unlink(missing_ok=True)
+    h264_path.with_suffix(".jpg").unlink(missing_ok=True)
+    parent_dir = h264_path.parent
+    try:
+        if parent_dir.exists() and not any(parent_dir.iterdir()):
+            parent_dir.rmdir()
+    except OSError:
+        pass
+
+
+def get_current_recording_target() -> Path | None:
+    try:
+        raw = paths.PATH_STATE.read_text()
+    except OSError:
+        return None
+
+    try:
+        state = _SelectorState.model_validate_json(raw)
+    except ValidationError:
+        return None
+
+    return Path(state.current_target) if state.current_target else None
 
 
 class DriveSelector:
@@ -112,23 +185,14 @@ class DriveSelector:
         self._restore_index_from_state()
 
     def _load_state(self) -> str:
-        try:
-            raw = _STATE_FILE.read_text()
-        except OSError:
-            return ""
-
-        try:
-            state = _SelectorState.model_validate_json(raw)
-        except ValidationError:
-            return ""
-
-        return state.current_target
+        target = get_current_recording_target()
+        return str(target) if target else ""
 
     def _save_state(self, current_target: str) -> None:
         try:
-            _STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            paths.PATH_DATA_USER.mkdir(parents=True, exist_ok=True)
             state = _SelectorState(current_target=current_target)
-            _STATE_FILE.write_text(state.model_dump_json())
+            paths.PATH_STATE.write_text(state.model_dump_json())
         except OSError as exc:
             logger.warning("Failed to persist selector state: %s", exc)
 

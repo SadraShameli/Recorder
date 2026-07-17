@@ -6,6 +6,7 @@ from types import FrameType
 from .camera import _MISSING_PICAMERA2, Recorder, cv2_available
 from .config import RecorderConfig
 from .storage import DriveSelector, get_targets, is_device_full, is_writable
+from .telegram.bot import TelegramBot
 
 logger = logging.getLogger(__name__)
 
@@ -74,3 +75,9 @@ def run_recorder(config: RecorderConfig) -> None:
                 break
 
     logger.info("Recorder shutdown complete")
+
+
+def run_telegram_bot(config: RecorderConfig) -> None:
+    shutdown_event = threading.Event()
+    _install_signal_handlers(shutdown_event)
+    TelegramBot(config, shutdown_event).run()

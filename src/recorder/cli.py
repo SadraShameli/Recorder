@@ -4,8 +4,8 @@ from pathlib import Path
 import click
 
 from .config import RecorderConfig
-from .main import run_recorder
-from .service import SystemdService
+from .main import run_recorder, run_telegram_bot
+from .service import RecorderServiceKind, SystemdService
 
 _DEFAULTS = RecorderConfig()
 
@@ -136,6 +136,40 @@ def run(
         raise click.ClickException(str(exc)) from exc
 
 
+@cli.command()
+@click.option(
+    "--recordings-dir",
+    type=click.Path(path_type=Path),
+    default=_DEFAULTS.recordings_dir,
+    show_default=True,
+    help="Fallback recording directory when no USB drive is present",
+)
+@click.option(
+    "--usb-mount-path",
+    type=click.Path(path_type=Path),
+    default=_DEFAULTS.usb_mount_path,
+    show_default=True,
+)
+@click.option(
+    "--min-free-space-gb",
+    type=float,
+    default=_DEFAULTS.min_free_space_gb,
+    show_default=True,
+)
+def telegram(
+    recordings_dir: Path, usb_mount_path: Path, min_free_space_gb: float
+) -> None:
+    config = RecorderConfig(
+        recordings_dir=recordings_dir,
+        usb_mount_path=usb_mount_path,
+        min_free_space_gb=min_free_space_gb,
+    )
+    try:
+        run_telegram_bot(config)
+    except RuntimeError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
 @cli.command("install-service")
 @click.option(
     "--restart-delay-seconds",
@@ -146,14 +180,21 @@ def run(
 )
 def install_service(restart_delay_seconds: int) -> None:
     try:
-        SystemdService(restart_delay_seconds).install()
+        for kind in RecorderServiceKind:
+            SystemdService(kind, restart_delay_seconds).install()
     except RuntimeError as exc:
         raise click.ClickException(str(exc)) from exc
+    click.echo(
+        "Reminder: /restart in Telegram needs a sudoers rule for "
+        "`systemctl restart recorder.service` — see the plan/README for the "
+        "one-line visudo setup."
+    )
 
 
 @cli.command("uninstall-service")
 def uninstall_service() -> None:
     try:
-        SystemdService().uninstall()
+        for kind in RecorderServiceKind:
+            SystemdService(kind).uninstall()
     except RuntimeError as exc:
         raise click.ClickException(str(exc)) from exc

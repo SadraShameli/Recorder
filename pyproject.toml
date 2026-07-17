@@ -4,6 +4,8 @@ dependencies = [
     "opencv-python-headless ; platform_system == 'Linux'",
     "pydantic>=2.13.4",
     "click>=8.4.2",
+    "httpx>=0.28.1",
+    "python-dotenv>=1.2.2",
 ]
 description = "Raspberry Pi continuous video recorder with auto-rotation"
 name = "recorder"

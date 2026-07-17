@@ -35,6 +35,10 @@ update:
 run:
 	uv run $(PACKAGE_NAME) run $(filter-out $@,$(MAKECMDGOALS))
 
+.PHONY: telegram
+telegram:
+	uv run $(PACKAGE_NAME) telegram $(filter-out $@,$(MAKECMDGOALS))
+
 .PHONY: format
 format:
 	uv run ruff format
@@ -59,6 +63,7 @@ help:
 	@echo ""
 	@echo "Application:"
 	@echo "   run                  Run $(PACKAGE_NAME) with the specified arguments"
+	@echo "   telegram             Run the Telegram bot with the specified arguments"
 	@echo ""
 	@echo "Development:"
 	@echo "   format               Format the project using ruff"

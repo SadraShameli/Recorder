@@ -13,4 +13,7 @@ wheels/
 .venv
 
 # Runtime state
-.tmp/
+data_user/*
+
+# Secrets
+.env
